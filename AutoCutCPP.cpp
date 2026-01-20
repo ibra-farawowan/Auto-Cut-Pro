@@ -169,18 +169,105 @@ void LogToUI(const string& msg) {
     SendMessageA(hEditLog, EM_REPLACESEL, 0, (LPARAM)f.c_str());
 }
 
-void DrawMatToHwnd(HWND hWnd, const cv::Mat& img) {
-    if (img.empty() || !IsWindow(hWnd)) return;
-    RECT rect; if (!GetClientRect(hWnd, &rect)) return;
-    int w = rect.right - rect.left; int h = rect.bottom - rect.top; if (w <= 0 || h <= 0) return;
-    Mat resized; try { cv::resize(img, resized, Size(w, h)); }
-    catch (...) { return; }
-    struct { BITMAPINFOHEADER bmiHeader; RGBQUAD bmiColors[256]; } bmi = { 0 };
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); bmi.bmiHeader.biWidth = resized.cols; bmi.bmiHeader.biHeight = -resized.rows;
-    bmi.bmiHeader.biPlanes = 1; bmi.bmiHeader.biBitCount = 8; bmi.bmiHeader.biCompression = BI_RGB;
-    for (int i = 0; i < 256; i++) { bmi.bmiColors[i].rgbBlue = bmi.bmiColors[i].rgbGreen = bmi.bmiColors[i].rgbRed = (BYTE)i; }
+// =========================================================
+// FUNGSI GAMBAR FINAL V2: ANTI-GEPENG & ANTI-MIRING (STRIDE FIX)
+// Timpa fungsi DrawMatToHwnd yang lama dengan ini
+// =========================================================
+void DrawMatToHwnd(HWND hWnd, const cv::Mat& imgSrc) {
+    if (imgSrc.empty() || !IsWindow(hWnd)) return;
+
+    // --- STEP 1: FIX "MIRING" (BYTE ALIGNMENT) ---
+    // Windows GDI mewajibkan setiap baris data harus kelipatan 4 byte.
+    // Jika tidak, gambar akan terlihat miring/sheared.
+    cv::Mat img;
+    int srcW = imgSrc.cols;
+    int srcH = imgSrc.rows;
+    int channels = imgSrc.channels();
+
+    // Hitung stride (lebar baris) yang dibutuhkan Windows (harus align 4 byte)
+    int stepBytes = (srcW * channels + 3) & -4;
+
+    // Jika stride OpenCV beda dengan stride Windows, kita harus padding
+    if (imgSrc.step != stepBytes) {
+        // Buat mat baru dengan stride yang sesuai
+        // Kita gunakan copyMakeBorder untuk padding kanan jika perlu, 
+        // tapi cara paling aman adalah clone dengan lebar yang pas.
+        // Cara simpel: Convert ke format yang pasti aman (misal BGR 24-bit biasanya aman jika width genap)
+        // Tapi untuk performa, kita copy manual atau biarkan OpenCV handle padding
+
+        // Solusi paling stabil: Pastikan lebar adalah kelipatan 4 untuk Grayscale
+        if (channels == 1 && (srcW % 4 != 0)) {
+            int pad = 4 - (srcW % 4);
+            cv::copyMakeBorder(imgSrc, img, 0, 0, 0, pad, cv::BORDER_CONSTANT, cv::Scalar(0));
+            // Update lebar sumber (img sekarang lebih lebar sedikit karena padding hitam di kanan)
+            // Tapi kita tetap display sesuai srcW asli di StretchDIBits nanti
+        }
+        else {
+            img = imgSrc;
+        }
+    }
+    else {
+        img = imgSrc;
+    }
+
+    // Update pointer data & ukuran buffer yang akan dipakai
+    int bufW = img.cols;
+    int bufH = img.rows;
+
+    // --- STEP 2: SIAPKAN KANVAS ---
+    RECT rect;
+    if (!GetClientRect(hWnd, &rect)) return;
+    int destW = rect.right - rect.left;
+    int destH = rect.bottom - rect.top;
+    if (destW <= 0 || destH <= 0) return;
+
     HDC hdc = GetDC(hWnd);
-    if (hdc) { StretchDIBits(hdc, 0, 0, w, h, 0, 0, resized.cols, resized.rows, resized.data, (const BITMAPINFO*)&bmi, DIB_RGB_COLORS, SRCCOPY); ReleaseDC(hWnd, hdc); }
+    if (!hdc) return;
+
+    // Bersihkan Background jadi Hitam (Letterbox)
+    HBRUSH hBrBG = CreateSolidBrush(RGB(0, 0, 0));
+    FillRect(hdc, &rect, hBrBG);
+    DeleteObject(hBrBG);
+
+    // --- STEP 3: HITUNG SKALA (ASPEK RASIO / ANTI-GEPENG) ---
+    // Kita gunakan srcW/srcH asli (bukan yang dipadding) untuk rasio
+    float scaleX = (float)destW / srcW;
+    float scaleY = (float)destH / srcH;
+    float scale = (scaleX < scaleY) ? scaleX : scaleY; // Ambil skala terkecil
+
+    int finalW = (int)(srcW * scale);
+    int finalH = (int)(srcH * scale);
+
+    // Posisi Tengah
+    int finalX = (destW - finalW) / 2;
+    int finalY = (destH - finalH) / 2;
+
+    // --- STEP 4: HEADER BITMAP ---
+    struct { BITMAPINFOHEADER bmiHeader; RGBQUAD bmiColors[256]; } bmi = { 0 };
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = bufW; // Gunakan lebar buffer (yang mungkin sudah dipadding)
+    bmi.bmiHeader.biHeight = -bufH; // Top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = (channels == 1) ? 8 : 24;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    if (channels == 1) {
+        for (int i = 0; i < 256; i++) {
+            bmi.bmiColors[i].rgbBlue = bmi.bmiColors[i].rgbGreen = bmi.bmiColors[i].rgbRed = (BYTE)i;
+        }
+    }
+
+    SetStretchBltMode(hdc, HALFTONE);
+    SetBrushOrgEx(hdc, 0, 0, NULL);
+
+    // --- STEP 5: GAMBAR ---
+    // Perhatikan: srcWidth yang diambil dari buffer adalah srcW asli, padding diabaikan saat display
+    StretchDIBits(hdc,
+        finalX, finalY, finalW, finalH, // Tujuan di layar
+        0, 0, srcW, srcH,               // Ambil dari buffer (abaikan padding kanan jika ada)
+        img.data, (const BITMAPINFO*)&bmi, DIB_RGB_COLORS, SRCCOPY);
+
+    ReleaseDC(hWnd, hdc);
 }
 
 void WorkerThread(string vidPath, string outDir, string targetName, double preSec, double postSec) {
@@ -324,8 +411,10 @@ void CreateUI_AutoCut(HWND hP) {
     hBtnDel = CreateWindowExA(0, "BUTTON", "Delete", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, xBase + 170, y + 35, 150, 35, hP, (HMENU)ID_BTN_DEL_PRESET, hInst, NULL);
     hEditPresetName = CreateWindowExA(0, "EDIT", "NewPreset", WS_CHILD | WS_VISIBLE | WS_BORDER, xBase, y + 80, 200, 28, hP, (HMENU)ID_EDIT_PRESET, hInst, NULL);
     hBtnSave = CreateWindowExA(0, "BUTTON", "Save", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, xBase + 210, y + 80, 110, 28, hP, (HMENU)ID_BTN_SAVE_PRESET, hInst, NULL);
-    hPreviewBox = CreateWindowExA(0, "STATIC", "", WS_CHILD | WS_VISIBLE | WS_BORDER | SS_BITMAP | SS_CENTERIMAGE, xBase + 360, y, 250, 110, hP, (HMENU)ID_STATIC_PREVIEW, hInst, NULL); y += 140;
-
+    // INI YANG BENAR:
+    hPreviewBox = CreateWindowExA(0, "STATIC", "",
+        WS_CHILD | WS_VISIBLE | WS_BORDER | SS_NOTIFY, // SS_BLACKRECT DIHAPUS
+        xBase + 360, y, 250, 110, hP, (HMENU)ID_STATIC_PREVIEW, hInst, NULL);
     hProgress = CreateWindowExA(0, PROGRESS_CLASS, NULL, WS_CHILD | WS_VISIBLE, xBase, y, 610, 12, hP, (HMENU)ID_PROGRESS, hInst, NULL);
     hLblPercent = CreateWindowExA(0, "STATIC", "0%", WS_CHILD | WS_VISIBLE, xBase, y + 15, 100, 20, hP, (HMENU)ID_LBL_PERCENT, hInst, NULL);
     hLblEta = CreateWindowExA(0, "STATIC", "ETA: -", WS_CHILD | WS_VISIBLE | SS_RIGHT, xBase + 410, y + 15, 200, 20, hP, (HMENU)ID_LBL_ETA, hInst, NULL);
@@ -340,6 +429,91 @@ void CreateUI_AutoCut(HWND hP) {
     SendMessage(hEditLog, WM_SETFONT, (WPARAM)hM, TRUE);
 }
 
+// --- FUNGSI BARU: MENGATUR UKURAN UI AGAR FIT WINDOW ---
+void AutoCutResize(int w, int h) {
+    if (!hEditFile) return; // Cegah crash jika UI belum siap
+
+    int xBase = 20;
+    int rMargin = 30; // Jarak dari pinggir kanan
+    int fullW = w - xBase - rMargin;
+    if (fullW < 400) fullW = 400; // Batas minimal lebar layout
+
+    // 1. SECTION FILE INPUT
+    // Label tetap di kiri, Tombol '...' di kanan, Edit box mengisi tengah
+    int btnW = 40;
+    int labelW = 100;
+    int editW = fullW - labelW - btnW - 10; // 10 = spacing
+
+    // Baris Video File (Y sekitar 43)
+    MoveWindow(hEditFile, xBase + labelW, 43, editW, 28, TRUE);
+    MoveWindow(hBtnFile, xBase + labelW + editW + 10, 43, btnW, 28, TRUE);
+
+    // Baris Output Path (Y sekitar 98)
+    MoveWindow(hEditOutput, xBase + labelW, 98, editW, 28, TRUE);
+    MoveWindow(hBtnOutput, xBase + labelW + editW + 10, 98, btnW, 28, TRUE);
+
+    // 2. SECTION CONFIG (Y sekitar 193)
+    // Kita panjangkan Input Player Name untuk mengisi ruang
+    // Pre-roll & Post-roll kita geser ke agak kanan agar rapi
+    int smallInputW = 50;
+    int lblSmallW = 80;
+
+    // Hitung posisi dari kanan untuk Post-Roll
+    int postX = xBase + fullW - smallInputW;
+    int lblPostX = postX - lblSmallW;
+
+    // Hitung posisi Pre-Roll (sebelah kiri Post-Roll)
+    int preX = lblPostX - smallInputW - 20;
+    int lblPreX = preX - lblSmallW;
+
+    // Player Name mengisi sisa ruang di kiri
+    int nameX = xBase + 100;
+    int nameW = lblPreX - nameX - 20;
+    if (nameW < 150) nameW = 150; // Safety width
+
+    MoveWindow(hEditName, nameX, 193, nameW, 28, TRUE);
+
+    MoveWindow(hLbl6, lblPreX, 196, lblSmallW, 20, TRUE); // Label Pre
+    MoveWindow(hEditPre, preX, 193, smallInputW, 28, TRUE); // Edit Pre
+
+    MoveWindow(hLbl7, lblPostX, 196, lblSmallW, 20, TRUE); // Label Post
+    MoveWindow(hEditPost, postX, 193, smallInputW, 28, TRUE); // Edit Post
+
+    // 3. SECTION ROI (Y sekitar 280)
+    // Kolom kiri (Combo/Button) tetap, Preview Box memanjang ke kanan
+    int leftColW = 320;
+    int previewX = xBase + leftColW + 20;
+    int previewW = fullW - (leftColW + 20);
+
+    // Pastikan preview box tingginya proporsional atau fix (misal 110)
+    MoveWindow(hPreviewBox, previewX, 280, previewW, 110, TRUE);
+
+    // 4. PROGRESS BAR & LOG (Y sekitar 420 ke bawah)
+    MoveWindow(hProgress, xBase, 420, fullW, 12, TRUE);
+
+    // Label % di kiri, Label ETA di kanan. Y=438 memberi jarak aman dari progress bar
+    MoveWindow(hLblPercent, xBase, 438, 100, 20, TRUE);
+    MoveWindow(hLblEta, xBase + fullW - 200, 438, 200, 20, TRUE); // ETA Rata Kanan
+
+    // Log Area (Mengisi sisa tinggi sampai tombol)
+    // Y=475 memberi jarak aman dari label persen/ETA
+    int logY = 475;
+    int btnH = 55;
+    int bottomMargin = 20;
+    // Hitung sisa tinggi window untuk Log agar tombol tetap di bawah
+    int logH = h - logY - btnH - bottomMargin - 20; // 20 spacing
+    if (logH < 100) logH = 100; // Minimal tinggi log
+
+    MoveWindow(hEditLog, xBase, logY, fullW, logH, TRUE);
+
+    // 5. TOMBOL START / STOP (Di bagian paling bawah log)
+    int btnY = logY + logH + 15;
+    int startW = (fullW * 0.65); // Start ambil 65% lebar
+    int stopW = fullW - startW - 10; // Stop ambil sisanya
+
+    MoveWindow(hBtnStart, xBase, btnY, startW, btnH, TRUE);
+    MoveWindow(hBtnCancel, xBase + startW + 10, btnY, stopW, btnH, TRUE);
+}
 void OpenRoiSelector(string v) { VideoCapture c(v); if (!c.isOpened())return; int vw = (int)c.get(CAP_PROP_FRAME_WIDTH); int vh = (int)c.get(CAP_PROP_FRAME_HEIGHT); int x = g_roiRect.x, y = g_roiRect.y, w = g_roiRect.width, h = g_roiRect.height; if (w <= 0) { x = (int)(vw * 0.64); y = (int)(vh * 0.39); w = (int)(vw * 0.15); h = (int)(vh * 0.13); } string n = "SETTING AREA - ENTER TO SAVE"; namedWindow(n, WINDOW_NORMAL); resizeWindow(n, 1280, (int)(1280.0 * vh / vw)); createTrackbar("X", n, &x, vw); createTrackbar("Y", n, &y, vh); createTrackbar("W", n, &w, vw); createTrackbar("H", n, &h, vh); Mat f, p; c.read(f); while (1) { f.copyTo(p); if (x < 0)x = 0; if (y < 0)y = 0; if (x + w > vw)w = vw - x; if (y + h > vh)h = vh - y; rectangle(p, Rect(x, y, w, h), Scalar(0, 255, 0), 3); imshow(n, p); if (waitKey(30) == 13) { g_roiRect = Rect(x, y, w, h); g_roiSet = true; destroyWindow(n); break; } if (getWindowProperty(n, WND_PROP_VISIBLE) < 1)break; } }
 void LoadPresetsFromFile() { g_presets.clear(); SendMessageA(hComboPreset, CB_RESETCONTENT, 0, 0); fs::path presetPath = fs::path(GetExeDir()) / "roi_presets.txt"; ifstream file(presetPath); if (file.is_open()) { string line; while (getline(file, line)) { if (line.empty()) continue; char name[128]; int x, y, w, h; if (sscanf(line.c_str(), "%127[^|]|%d|%d|%d|%d", name, &x, &y, &w, &h) == 5) { g_presets.push_back({ string(name), x, y, w, h }); SendMessageA(hComboPreset, CB_ADDSTRING, 0, (LPARAM)name); } } file.close(); } if (g_presets.empty()) { SendMessageA(hComboPreset, CB_ADDSTRING, 0, (LPARAM)"- Default -"); g_roiRect = Rect(0, 0, 0, 0); g_roiSet = false; } else { SendMessageA(hComboPreset, CB_SETCURSEL, 0, 0); g_roiRect = Rect(g_presets[0].x, g_presets[0].y, g_presets[0].w, g_presets[0].h); g_roiSet = true; } }
 void SavePresetToFile(string n, Rect r) { bool found = false; for (auto& p : g_presets) { if (p.name == n) { p.x = r.x; p.y = r.y; p.w = r.width; p.h = r.height; found = true; break; } } if (!found)g_presets.push_back({ n,r.x,r.y,r.width,r.height }); fs::path p = fs::path(GetExeDir()) / "roi_presets.txt"; ofstream f(p); if (f.is_open()) { for (const auto& pr : g_presets)f << pr.name << "|" << pr.x << "|" << pr.y << "|" << pr.w << "|" << pr.h << endl; f.close(); MessageBoxA(hMainFrame, "Tersimpan!", "Success", MB_OK); LoadPresetsFromFile(); } }
@@ -538,7 +712,13 @@ void ShowView(int id) {
 
 LRESULT CALLBACK AutoCutProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+    case WM_SIZE:
+        // --- PANGGIL FUNGSI RESIZE SAAT WINDOW BERUBAH UKURAN ---
+        AutoCutResize(LOWORD(lParam), HIWORD(lParam));
+        break;
+
     case WM_COMMAND:
+        // Handle Tombol Auto Cut (Sama seperti sebelumnya)
         if (LOWORD(wParam) == ID_BTN_FILE) { string f = OpenFileDialog(hwnd); if (!f.empty()) SetWindowTextA(hEditFile, f.c_str()); }
         else if (LOWORD(wParam) == ID_BTN_OUTPUT) { string f = SelectFolderDialog(hwnd); if (!f.empty()) SetWindowTextA(hEditOutput, f.c_str()); }
         else if (LOWORD(wParam) == ID_BTN_ROI) { char f[MAX_PATH]; GetWindowTextA(hEditFile, f, MAX_PATH); if (strlen(f) > 0) OpenRoiSelector(f); else MessageBoxA(hwnd, "Pilih video!", "Info", MB_OK); }
@@ -555,23 +735,30 @@ LRESULT CALLBACK AutoCutProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             }
         }
         else if (LOWORD(wParam) == ID_BTN_CANCEL) { if (isRunning) stopRequested = true; }
+
+        // Placeholder Logic
         if (HIWORD(wParam) == EN_SETFOCUS && LOWORD(wParam) == ID_EDIT_NAME) { char cur[100]; GetWindowTextA(hEditName, cur, 100); if (string(cur) == PLAYER_PLACEHOLDER) SetWindowTextA(hEditName, ""); }
         else if (HIWORD(wParam) == EN_KILLFOCUS && LOWORD(wParam) == ID_EDIT_NAME) { char cur[100]; GetWindowTextA(hEditName, cur, 100); if (strlen(cur) == 0) SetWindowTextA(hEditName, PLAYER_PLACEHOLDER.c_str()); }
         break;
+
     case WM_CTLCOLORSTATIC: {
         HDC hdc = (HDC)wParam; HWND hCtl = (HWND)lParam;
         if (hCtl == hEditLog) { SetTextColor(hdc, COL_LOG_PURPLE); SetBkColor(hdc, COL_LOG_BG); static HBRUSH hbLog = CreateSolidBrush(COL_LOG_BG); return (LRESULT)hbLog; }
         SetTextColor(hdc, COL_TEXT_WHITE); SetBkColor(hdc, COL_BG_MAIN); return (LRESULT)CreateSolidBrush(COL_BG_MAIN);
     }
     case WM_CTLCOLOREDIT: { HDC hdc = (HDC)wParam; SetTextColor(hdc, COL_TEXT_WHITE); SetBkColor(hdc, COL_INPUT_BG); static HBRUSH hbIn = CreateSolidBrush(COL_INPUT_BG); return (LRESULT)hbIn; }
+
+                        // AutoCut Custom Draw Buttons
     case WM_DRAWITEM: {
         LPDRAWITEMSTRUCT pD = (LPDRAWITEMSTRUCT)lParam;
         if (pD->CtlType == ODT_BUTTON) {
             HDC hdc = pD->hDC; RECT r = pD->rcItem; COLORREF bg, tx = COL_TEXT_WHITE; bool sel = (pD->itemState & ODS_SELECTED); bool disabled = (pD->itemState & ODS_DISABLED);
+
             if (disabled) bg = RGB(80, 80, 80);
             else if (pD->CtlID == ID_BTN_START) bg = sel ? RGB(60, 80, 200) : COL_BTN_BLUE;
             else if (pD->CtlID == ID_BTN_CANCEL) bg = sel ? RGB(200, 40, 50) : COL_BTN_RED;
             else bg = sel ? COL_BTN_HOVER : COL_BTN_NORMAL;
+
             HBRUSH hBr = CreateSolidBrush(bg); FillRect(hdc, &r, hBr); DeleteObject(hBr);
             SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, disabled ? RGB(150, 150, 150) : tx); char b[128]; GetWindowTextA(pD->hwndItem, b, 128); DrawTextA(hdc, b, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE); return TRUE;
         }
@@ -677,7 +864,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
             0, 0, 250, 900, hwnd, NULL, hInst, NULL);
 
-        HWND hLogo = CreateWindowExA(0, "STATIC", "AUTO CUT\nPRO V48", WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 40, 250, 60, hwnd, (HMENU)ID_STATIC_LOGO, hInst, NULL);
+        HWND hLogo = CreateWindowExA(0, "STATIC", "AUTO CUT\nPRO V1.1", WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 40, 250, 60, hwnd, (HMENU)ID_STATIC_LOGO, hInst, NULL);
         SendMessage(hLogo, WM_SETFONT, (WPARAM)CreateSFPro(24, FW_BOLD), TRUE);
 
         int btnY = 140; int btnH = 50;
@@ -703,7 +890,7 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
         hViewAbout = CreateWindowExA(0, "PanelTextDark", NULL, WS_CHILD, 40, 40, 600, 400, hContentArea, NULL, hInst, NULL);
 
         HWND hTxtG = CreateWindowExA(0, "STATIC", "PANDUAN:\n1. Dashboard: Lakukan Scan kill feed di sini.\n2. Hasil Scan: Load Video & CSV hasil scan untuk export.\n\nJangan lupa set ffmpeg.exe di folder aplikasi.", WS_CHILD | WS_VISIBLE, 0, 0, 600, 400, hViewGuide, NULL, hInst, NULL);
-        HWND hTxtA = CreateWindowExA(0, "STATIC", "AUTO CUT ALL-IN-ONE\nGabungan AutoCut V48 & LossCut Player.\n\nAll Bugs Fixed (Drag, Ghosting, Z-Order).", WS_CHILD | WS_VISIBLE, 0, 0, 600, 400, hViewAbout, NULL, hInst, NULL);
+        HWND hTxtA = CreateWindowExA(0, "STATIC", "AUTO CUT PRO V1.1\nGabungan AutoCut V48 & LossCut Player.\n\nAll Bugs Fixed (Drag, Ghosting, Z-Order).", WS_CHILD | WS_VISIBLE, 0, 0, 600, 400, hViewAbout, NULL, hInst, NULL);
         SendMessage(hTxtG, WM_SETFONT, (WPARAM)CreateSFPro(16), TRUE); SendMessage(hTxtA, WM_SETFONT, (WPARAM)CreateSFPro(16), TRUE);
 
         ShowView(0); break;
@@ -760,7 +947,7 @@ int main() {
     CoInitialize(NULL);
     WNDCLASSA wc = { 0 }; wc.lpfnWndProc = MainProc; wc.hInstance = GetModuleHandle(NULL); wc.lpszClassName = "AutoCutAllInOne";
     wc.hbrBackground = CreateSolidBrush(COL_BG_MAIN); wc.hCursor = LoadCursor(NULL, IDC_ARROW); RegisterClassA(&wc);
-    hMainFrame = CreateWindowExA(0, "AutoCutAllInOne", "Auto Cut Pro - All In One", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1280, 760, NULL, NULL, GetModuleHandle(NULL), NULL);
+    hMainFrame = CreateWindowExA(0, "AutoCutAllInOne", "Auto Cut Pro - 1.1", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1280, 760, NULL, NULL, GetModuleHandle(NULL), NULL);
     ShowWindow(hMainFrame, SW_SHOW);
 
     MSG msg = { 0 };
